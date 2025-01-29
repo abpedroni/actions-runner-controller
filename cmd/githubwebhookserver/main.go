@@ -26,23 +26,27 @@ import (
 	"sync"
 	"time"
 
-	actionsv1alpha1 "github.com/actions-runner-controller/actions-runner-controller/api/v1alpha1"
-	"github.com/actions-runner-controller/actions-runner-controller/controllers"
-	"github.com/actions-runner-controller/actions-runner-controller/github"
-	"github.com/actions-runner-controller/actions-runner-controller/logging"
+	actionsv1alpha1 "github.com/actions/actions-runner-controller/apis/actions.summerwind.net/v1alpha1"
+	actionssummerwindnet "github.com/actions/actions-runner-controller/controllers/actions.summerwind.net"
+	"github.com/actions/actions-runner-controller/github"
+	"github.com/actions/actions-runner-controller/logging"
+
 	"github.com/kelseyhightower/envconfig"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/exec"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/gcp"
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	// +kubebuilder:scaffold:imports
 )
 
 var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	scheme = runtime.NewScheme()
 )
 
 const (
@@ -69,9 +73,9 @@ func main() {
 
 		watchNamespace string
 
-		enableLeaderElection bool
-		syncPeriod           time.Duration
-		logLevel             string
+		logLevel   string
+		queueLimit int
+		logFormat  string
 
 		ghClient *github.Client
 	)
@@ -88,10 +92,8 @@ func main() {
 	flag.StringVar(&webhookAddr, "webhook-addr", ":8000", "The address the metric endpoint binds to.")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&watchNamespace, "watch-namespace", "", "The namespace to watch for HorizontalRunnerAutoscaler's to scale on Webhook. Set to empty for letting it watch for all namespaces.")
-	flag.BoolVar(&enableLeaderElection, "enable-leader-election", false,
-		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
-	flag.DurationVar(&syncPeriod, "sync-period", 10*time.Minute, "Determines the minimum frequency at which K8s resources managed by this controller are reconciled. When you use autoscaling, set to a lower value like 10 minute, because this corresponds to the minimum time to react on demand change")
 	flag.StringVar(&logLevel, "log-level", logging.LogLevelDebug, `The verbosity of the logging. Valid values are "debug", "info", "warn", "error". Defaults to "debug".`)
+	flag.IntVar(&queueLimit, "queue-limit", actionssummerwindnet.DefaultQueueLimit, `The maximum length of the scale operation queue. The scale opration is enqueued per every matching webhook event, and the server returns a 500 HTTP status when the queue was already full on enqueue attempt.`)
 	flag.StringVar(&webhookSecretToken, "github-webhook-secret-token", "", "The personal access token of GitHub.")
 	flag.StringVar(&c.Token, "github-token", c.Token, "The personal access token of GitHub.")
 	flag.Int64Var(&c.AppID, "github-app-id", c.AppID, "The application ID of GitHub App.")
@@ -102,25 +104,31 @@ func main() {
 	flag.StringVar(&c.BasicauthUsername, "github-basicauth-username", c.BasicauthUsername, "Username for GitHub basic auth to use instead of PAT or GitHub APP in case it's running behind a proxy API")
 	flag.StringVar(&c.BasicauthPassword, "github-basicauth-password", c.BasicauthPassword, "Password for GitHub basic auth to use instead of PAT or GitHub APP in case it's running behind a proxy API")
 	flag.StringVar(&c.RunnerGitHubURL, "runner-github-url", c.RunnerGitHubURL, "GitHub URL to be used by runners during registration")
+	flag.StringVar(&logFormat, "log-format", "text", `The log format. Valid options are "text" and "json". Defaults to "text"`)
 
 	flag.Parse()
 
+	logger, err := logging.NewLogger(logLevel, logFormat)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: creating logger: %v\n", err)
+		os.Exit(1)
+	}
+	logger.WithName("setup")
+
 	if webhookSecretToken == "" && webhookSecretTokenEnv != "" {
-		setupLog.Info(fmt.Sprintf("Using the value from %s for -github-webhook-secret-token", webhookSecretTokenEnvName))
+		logger.Info(fmt.Sprintf("Using the value from %s for -github-webhook-secret-token", webhookSecretTokenEnvName))
 		webhookSecretToken = webhookSecretTokenEnv
 	}
 
 	if webhookSecretToken == "" {
-		setupLog.Info(fmt.Sprintf("-github-webhook-secret-token and %s are missing or empty. Create one following https://docs.github.com/en/developers/webhooks-and-events/securing-your-webhooks and specify it via the flag or the envvar", webhookSecretTokenEnvName))
+		logger.Info(fmt.Sprintf("-github-webhook-secret-token and %s are missing or empty. Create one following https://docs.github.com/en/developers/webhooks-and-events/securing-your-webhooks and specify it via the flag or the envvar", webhookSecretTokenEnvName))
 	}
 
 	if watchNamespace == "" {
-		setupLog.Info("-watch-namespace is empty. HorizontalRunnerAutoscalers in all the namespaces are watched, cached, and considered as scale targets.")
+		logger.Info("-watch-namespace is empty. HorizontalRunnerAutoscalers in all the namespaces are watched, cached, and considered as scale targets.")
 	} else {
-		setupLog.Info("-watch-namespace is %q. Only HorizontalRunnerAutoscalers in %q are watched, cached, and considered as scale targets.")
+		logger.Info(fmt.Sprintf("-watch-namespace is %q. Only HorizontalRunnerAutoscalers in %q are watched, cached, and considered as scale targets.", watchNamespace, watchNamespace))
 	}
-
-	logger := logging.NewLogger(logLevel)
 
 	ctrl.SetLogger(logger)
 
@@ -135,27 +143,35 @@ func main() {
 		ghClient, err = c.NewClient()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "Error: Client creation failed.", err)
-			setupLog.Error(err, "unable to create controller", "controller", "Runner")
+			logger.Error(err, "unable to create controller", "controller", "Runner")
 			os.Exit(1)
 		}
 	} else {
-		setupLog.Info("GitHub client is not initialized. Runner groups with custom visibility are not supported. If needed, please provide GitHub authentication. This will incur in extra GitHub API calls")
+		logger.Info("GitHub client is not initialized. Runner groups with custom visibility are not supported. If needed, please provide GitHub authentication. This will incur in extra GitHub API calls")
 	}
 
+	syncPeriod := 10 * time.Minute
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:             scheme,
-		SyncPeriod:         &syncPeriod,
-		LeaderElection:     enableLeaderElection,
-		Namespace:          watchNamespace,
-		MetricsBindAddress: metricsAddr,
-		Port:               9443,
+		Scheme: scheme,
+		Cache: cache.Options{
+			SyncPeriod: &syncPeriod,
+			DefaultNamespaces: map[string]cache.Config{
+				watchNamespace: {},
+			},
+		},
+		Metrics: metricsserver.Options{
+			BindAddress: metricsAddr,
+		},
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Port: 9443,
+		}),
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		logger.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	hraGitHubWebhook := &controllers.HorizontalRunnerAutoscalerGitHubWebhook{
+	hraGitHubWebhook := &actionssummerwindnet.HorizontalRunnerAutoscalerGitHubWebhook{
 		Name:           "webhookbasedautoscaler",
 		Client:         mgr.GetClient(),
 		Log:            ctrl.Log.WithName("controllers").WithName("webhookbasedautoscaler"),
@@ -164,10 +180,11 @@ func main() {
 		SecretKeyBytes: []byte(webhookSecretToken),
 		Namespace:      watchNamespace,
 		GitHubClient:   ghClient,
+		QueueLimit:     queueLimit,
 	}
 
 	if err = hraGitHubWebhook.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "webhookbasedautoscaler")
+		logger.Error(err, "unable to create controller", "controller", "webhookbasedautoscaler")
 		os.Exit(1)
 	}
 
@@ -180,9 +197,9 @@ func main() {
 		defer cancel()
 		defer wg.Done()
 
-		setupLog.Info("starting webhook server")
+		logger.Info("starting webhook server")
 		if err := mgr.Start(ctx); err != nil {
-			setupLog.Error(err, "problem running manager")
+			logger.Error(err, "problem running manager")
 			os.Exit(1)
 		}
 	}()
@@ -208,7 +225,7 @@ func main() {
 
 		if err := srv.ListenAndServe(); err != nil {
 			if !errors.Is(err, http.ErrServerClosed) {
-				setupLog.Error(err, "problem running http server")
+				logger.Error(err, "problem running http server")
 			}
 		}
 	}()

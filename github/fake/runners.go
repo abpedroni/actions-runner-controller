@@ -6,9 +6,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 
-	"github.com/actions-runner-controller/actions-runner-controller/api/v1alpha1"
+	"github.com/actions/actions-runner-controller/apis/actions.summerwind.net/v1alpha1"
 
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v52/github"
 	"github.com/gorilla/mux"
 )
 

@@ -10,11 +10,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/actions-runner-controller/actions-runner-controller/github/metrics"
-	"github.com/actions-runner-controller/actions-runner-controller/logging"
-	"github.com/bradleyfalzon/ghinstallation"
+	"github.com/actions/actions-runner-controller/build"
+	"github.com/actions/actions-runner-controller/github/metrics"
+	"github.com/actions/actions-runner-controller/logging"
+	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/go-logr/logr"
-	"github.com/google/go-github/v39/github"
+	"github.com/google/go-github/v52/github"
 	"github.com/gregjones/httpcache"
 	"golang.org/x/oauth2"
 )
@@ -42,6 +43,7 @@ type Client struct {
 	mu        sync.Mutex
 	// GithubBaseURL to Github without API suffix.
 	GithubBaseURL string
+	IsEnterprise  bool
 }
 
 type BasicAuthTransport struct {
@@ -82,6 +84,8 @@ func (c *Config) NewClient() (*Client, error) {
 				return nil, fmt.Errorf("enterprise url incorrect: %v", err)
 			}
 			tr.BaseURL = githubAPIURL
+		} else if c.URL != "" && tr.BaseURL != c.URL {
+			tr.BaseURL = c.URL
 		}
 		transport = tr
 	}
@@ -92,10 +96,14 @@ func (c *Config) NewClient() (*Client, error) {
 	metricsTransport := metrics.Transport{Transport: loggingTransport}
 	httpClient := &http.Client{Transport: metricsTransport}
 
+	metrics.Register()
+
 	var client *github.Client
 	var githubBaseURL string
+	var isEnterprise bool
 	if len(c.EnterpriseURL) > 0 {
 		var err error
+		isEnterprise = true
 		client, err = github.NewEnterpriseClient(c.EnterpriseURL, c.EnterpriseURL, httpClient)
 		if err != nil {
 			return nil, fmt.Errorf("enterprise client creation failed: %v", err)
@@ -134,14 +142,13 @@ func (c *Config) NewClient() (*Client, error) {
 			}
 		}
 	}
-
-	client.UserAgent = "actions-runner-controller"
-
+	client.UserAgent = "actions-runner-controller/" + build.Version
 	return &Client{
 		Client:        client,
 		regTokens:     map[string]*github.RegistrationToken{},
 		mu:            sync.Mutex{},
 		GithubBaseURL: githubBaseURL,
+		IsEnterprise:  isEnterprise,
 	}, nil
 }
 
@@ -163,7 +170,7 @@ func (c *Client) GetRegistrationToken(ctx context.Context, enterprise, org, repo
 	// https://docs.github.com/en/rest/overview/resources-in-the-rest-api#conditional-requests
 	//
 	// This is currently set to 30 minutes as the result of the discussion took place at the following issue:
-	// https://github.com/actions-runner-controller/actions-runner-controller/issues/1295
+	// https://github.com/actions/actions-runner-controller/issues/1295
 	runnerStartupTimeout := 30 * time.Minute
 
 	if ok && rt.GetExpiresAt().After(time.Now().Add(runnerStartupTimeout)) {
@@ -243,37 +250,27 @@ func (c *Client) ListRunners(ctx context.Context, enterprise, org, repo string) 
 	return runners, nil
 }
 
-// ListOrganizationRunnerGroups returns all the runner groups defined in the organization and
-// inherited to the organization from an enterprise.
-func (c *Client) ListOrganizationRunnerGroups(ctx context.Context, org string) ([]*github.RunnerGroup, error) {
-	var runnerGroups []*github.RunnerGroup
-
-	opts := github.ListOptions{PerPage: 100}
-	for {
-		list, res, err := c.Client.Actions.ListOrganizationRunnerGroups(ctx, org, &opts)
-		if err != nil {
-			return runnerGroups, fmt.Errorf("failed to list organization runner groups: %w", err)
-		}
-
-		runnerGroups = append(runnerGroups, list.RunnerGroups...)
-		if res.NextPage == 0 {
-			break
-		}
-		opts.Page = res.NextPage
-	}
-
-	return runnerGroups, nil
-}
-
 // ListOrganizationRunnerGroupsForRepository returns all the runner groups defined in the organization and
 // inherited to the organization from an enterprise.
 // We can remove this when google/go-github library is updated to support this.
 func (c *Client) ListOrganizationRunnerGroupsForRepository(ctx context.Context, org, repo string) ([]*github.RunnerGroup, error) {
 	var runnerGroups []*github.RunnerGroup
 
-	opts := github.ListOptions{PerPage: 100}
+	var opts github.ListOrgRunnerGroupOptions
+
+	opts.PerPage = 100
+
+	repoName := repo
+	parts := strings.Split(repo, "/")
+	if len(parts) == 2 {
+		repoName = parts[1]
+	}
+	// This must be the repo name without the owner part, so in case the repo is "myorg/myrepo" the repo name
+	// passed to visible_to_repository must be "myrepo".
+	opts.VisibleToRepository = repoName
+
 	for {
-		list, res, err := c.listOrganizationRunnerGroupsVisibleToRepo(ctx, org, repo, &opts)
+		list, res, err := c.Actions.ListOrganizationRunnerGroups(ctx, org, &opts)
 		if err != nil {
 			return runnerGroups, fmt.Errorf("failed to list organization runner groups: %w", err)
 		}
@@ -307,42 +304,6 @@ func (c *Client) ListRunnerGroupRepositoryAccesses(ctx context.Context, org stri
 	}
 
 	return repos, nil
-}
-
-// listOrganizationRunnerGroupsVisibleToRepo lists all self-hosted runner groups configured in an organization which can be used by the repository.
-//
-// GitHub API docs: https://docs.github.com/en/rest/reference/actions#list-self-hosted-runner-groups-for-an-organization
-func (c *Client) listOrganizationRunnerGroupsVisibleToRepo(ctx context.Context, org, repo string, opts *github.ListOptions) (*github.RunnerGroups, *github.Response, error) {
-	repoName := repo
-	parts := strings.Split(repo, "/")
-	if len(parts) == 2 {
-		repoName = parts[1]
-	}
-
-	u := fmt.Sprintf("orgs/%v/actions/runner-groups?visible_to_repository=%v", org, repoName)
-
-	if opts != nil {
-		if opts.PerPage > 0 {
-			u = fmt.Sprintf("%v&per_page=%v", u, opts.PerPage)
-		}
-
-		if opts.Page > 0 {
-			u = fmt.Sprintf("%v&page=%v", u, opts.Page)
-		}
-	}
-
-	req, err := c.Client.NewRequest("GET", u, nil)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	groups := &github.RunnerGroups{}
-	resp, err := c.Client.Do(ctx, req, &groups)
-	if err != nil {
-		return nil, resp, err
-	}
-
-	return groups, resp, nil
 }
 
 // cleanup removes expired registration tokens.
@@ -462,7 +423,6 @@ func splitOwnerAndRepo(repo string) (string, string, error) {
 	}
 	return chunk[0], chunk[1], nil
 }
-
 func getEnterpriseApiUrl(baseURL string) (string, error) {
 	baseEndpoint, err := url.Parse(baseURL)
 	if err != nil {

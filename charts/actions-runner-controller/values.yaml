@@ -6,19 +6,14 @@ labels: {}
 
 replicaCount: 1
 
-syncPeriod: 10m
+webhookPort: 9443
+syncPeriod: 1m
 defaultScaleDownDelay: 10m
 
 enableLeaderElection: true
 # Specifies the controller id for leader election.
 # Must be unique if more than one controller installed onto the same namespace.
 #leaderElectionId: "actions-runner-controller"
-
-# DEPRECATED: This has been removed as unnecessary in #1192
-# The controller tries its best not to repeat the duplicate GitHub API call
-# within this duration.
-# Defaults to syncPeriod - 10s.
-#githubAPICacheDuration: 30s
 
 # The URL of your GitHub Enterprise server, if you're using one.
 #githubEnterpriseServerURL: https://github.example.com
@@ -35,7 +30,7 @@ enableLeaderElection: true
 #
 # Do set authSecret.enabled=false and set env if you want full control over
 # the GitHub authn related envvars of the container.
-# See https://github.com/actions-runner-controller/actions-runner-controller/pull/937 for more details.
+# See https://github.com/actions/actions-runner-controller/pull/937 for more details.
 authSecret:
   enabled: true
   create: false
@@ -52,6 +47,7 @@ authSecret:
   #github_basicauth_username: ""
   #github_basicauth_password: ""
 
+# http(s) should be specified for dockerRegistryMirror, e.g.: dockerRegistryMirror="https://<your-docker-registry-mirror>"
 dockerRegistryMirror: ""
 image:
   repository: "summerwind/actions-runner-controller"
@@ -65,6 +61,18 @@ image:
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
+
+runner:
+  statusUpdateHook:
+    enabled: false
+
+rbac:
+  {}
+  # # This allows ARC to dynamically create a ServiceAccount and a Role for each Runner pod that uses "kubernetes" container mode,
+  # # by extending ARC's manager role to have the same permissions required by the pod runs the runner agent in "kubernetes" container mode.
+  # # Without this, Kubernetes blocks ARC to create the role to prevent a privilege escalation.
+  # # See https://github.com/actions/actions-runner-controller/pull/1268/files#r917327010
+  # allowGrantingKubernetesContainerModePermissions: true
 
 serviceAccount:
   # Specifies whether a service account should be created
@@ -101,14 +109,18 @@ service:
 # Metrics service resource
 metrics:
   serviceAnnotations: {}
-  serviceMonitor: false
+  serviceMonitor:
+    enable: false
+    namespace: ""
+    timeout: 30s
+    interval: 1m
   serviceMonitorLabels: {}
   port: 8443
   proxy:
     enabled: true
     image:
       repository: quay.io/brancz/kube-rbac-proxy
-      tag: v0.11.0
+      tag: v0.13.1
 
 resources:
   {}
@@ -140,11 +152,20 @@ podDisruptionBudget:
 # PriorityClass: system-cluster-critical
 priorityClassName: ""
 
-env:
-  {}
+# env:
+  # specify additional environment variables for the controller pod.
+  # It's possible to specify either key vale pairs e.g.:
   # http_proxy: "proxy.com:8080"
   # https_proxy: "proxy.com:8080"
   # no_proxy: ""
+
+  # or a list of complete environment variable definitions e.g.:
+  # - name: GITHUB_APP_INSTALLATION_ID
+  #   valueFrom:
+  #     secretKeyRef:
+  #       key: some_key_in_the_secret
+  #       name: some-secret-name
+  #       optional: true
 
 ## specify additional volumes to mount in the manager container, this can be used
 ## to specify additional storage of material or to inject files from ConfigMaps
@@ -168,20 +189,39 @@ admissionWebHooks:
   #caBundle: "Ci0tLS0tQk...<base64-encoded PEM bundle containing the CA that signed the webhook's serving certificate>...tLS0K"
 
 # There may be alternatives to setting `hostNetwork: true`, see
-# https://github.com/actions-runner-controller/actions-runner-controller/issues/1005#issuecomment-993097155
+# https://github.com/actions/actions-runner-controller/issues/1005#issuecomment-993097155
 #hostNetwork: true
+
+# If you use `hostNetwork: true`, then you need dnsPolicy: ClusterFirstWithHostNet
+# https://kubernetes.io/docs/concepts/services-networking/dns-pod-service/#pod-s-dns-policy
+#dnsPolicy: ClusterFirst
+
+## specify log format for actions runner controller.  Valid options are "text" and "json"
+logFormat: text
+
+# enable setting the docker group id for the runner container
+# https://github.com/actions/actions-runner-controller/pull/2499
+#dockerGID: 121
 
 githubWebhookServer:
   enabled: false
   replicaCount: 1
-  syncPeriod: 10m
   useRunnerGroupsVisibility: false
+  ## specify log format for github webhook server.  Valid options are "text" and "json"
+  logFormat: text
   secret:
     enabled: false
     create: false
     name: "github-webhook-server"
     ### GitHub Webhook Configuration
     github_webhook_secret_token: ""
+    ### GitHub Apps Configuration
+    ## NOTE: IDs MUST be strings, use quotes
+    #github_app_id: ""
+    #github_app_installation_id: ""
+    #github_app_private_key: |
+    ### GitHub PAT Configuration
+    #github_token: ""
   imagePullSecrets: []
   nameOverride: ""
   fullnameOverride: ""
@@ -212,6 +252,7 @@ githubWebhookServer:
         protocol: TCP
         name: http
         #nodePort: someFixedPortForUseWithTerraformCdkCfnEtc
+    loadBalancerSourceRanges: []
   ingress:
     enabled: false
     ingressClassName: ""
@@ -223,6 +264,20 @@ githubWebhookServer:
         paths: []
         #  - path: /*
         #    pathType: ImplementationSpecific
+        # Extra paths that are not automatically connected to the server. This is useful when working with annotation based services.
+        extraPaths: []
+        # - path: /*
+        #   backend:
+        #     serviceName: ssl-redirect
+        #     servicePort: use-annotation
+        ## for Kubernetes >=1.19 (when "networking.k8s.io/v1" is used)
+        # - path: /*
+        #   pathType: Prefix
+        #   backend:
+        #     service:
+        #       name: ssl-redirect
+        #       port:
+        #         name: use-annotation
     tls: []
     #  - secretName: chart-example-tls
     #    hosts:
@@ -233,3 +288,135 @@ githubWebhookServer:
     enabled: false
     # minAvailable: 1
     # maxUnavailable: 3
+  # queueLimit: 100
+  terminationGracePeriodSeconds: 10
+  lifecycle: {}
+  # specify additional environment variables for the webhook server pod.
+  # It's possible to specify either key vale pairs e.g.:
+  # my_env_var: "some value"
+  # my_other_env_var: "other value"
+
+  # or a list of complete environment variable definitions e.g.:
+  # - name: GITHUB_WEBHOOK_SECRET_TOKEN
+  #   valueFrom:
+  #     secretKeyRef:
+  #       key: GITHUB_WEBHOOK_SECRET_TOKEN
+  #       name: prod-gha-controller-webhook-token
+  #       optional: true
+  # env:
+
+actionsMetrics:
+  serviceAnnotations: {}
+  # Set serviceMonitor=true to create a service monitor
+  # as a part of the helm release.
+  # Do note that you also need actionsMetricsServer.enabled=true
+  # to deploy the actions-metrics-server whose k8s service is referenced by the service monitor.
+  serviceMonitor:
+    enable: false
+    namespace: ""
+    timeout: 30s
+    interval: 1m
+  serviceMonitorLabels: {}
+  port: 8443
+  proxy:
+    enabled: true
+    image:
+      repository: quay.io/brancz/kube-rbac-proxy
+      tag: v0.13.1
+  # specify additional environment variables for the webhook server pod.
+  # It's possible to specify either key vale pairs e.g.:
+  # my_env_var: "some value"
+  # my_other_env_var: "other value"
+
+  # or a list of complete environment variable definitions e.g.:
+  # - name: GITHUB_WEBHOOK_SECRET_TOKEN
+  #   valueFrom:
+  #     secretKeyRef:
+  #       key: GITHUB_WEBHOOK_SECRET_TOKEN
+  #       name: prod-gha-controller-webhook-token
+  #       optional: true
+  # env:
+
+actionsMetricsServer:
+  enabled: false
+  # DO NOT CHANGE THIS!
+  # See the thread below for more context.
+  # https://github.com/actions/actions-runner-controller/pull/1814#discussion_r974758924
+  replicaCount: 1
+  ## specify log format for actions metrics server.  Valid options are "text" and "json"
+  logFormat: text
+  secret:
+    enabled: false
+    create: false
+    name: "actions-metrics-server"
+    ### GitHub Webhook Configuration
+    github_webhook_secret_token: ""
+    ### GitHub Apps Configuration
+    ## NOTE: IDs MUST be strings, use quotes
+    #github_app_id: ""
+    #github_app_installation_id: ""
+    #github_app_private_key: |
+    ### GitHub PAT Configuration
+    #github_token: ""
+  imagePullSecrets: []
+  nameOverride: ""
+  fullnameOverride: ""
+  serviceAccount:
+    # Specifies whether a service account should be created
+    create: true
+    # Annotations to add to the service account
+    annotations: {}
+    # The name of the service account to use.
+    # If not set and create is true, a name is generated using the fullname template
+    name: ""
+  podAnnotations: {}
+  podLabels: {}
+  podSecurityContext: {}
+  # fsGroup: 2000
+  securityContext: {}
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+  service:
+    type: ClusterIP
+    annotations: {}
+    ports:
+      - port: 80
+        targetPort: http
+        protocol: TCP
+        name: http
+        #nodePort: someFixedPortForUseWithTerraformCdkCfnEtc
+    loadBalancerSourceRanges: []
+  ingress:
+    enabled: false
+    ingressClassName: ""
+    annotations: {}
+      # kubernetes.io/ingress.class: nginx
+      # kubernetes.io/tls-acme: "true"
+    hosts:
+      - host: chart-example.local
+        paths: []
+        #  - path: /*
+        #    pathType: ImplementationSpecific
+        # Extra paths that are not automatically connected to the server. This is useful when working with annotation based services.
+        extraPaths: []
+        # - path: /*
+        #   backend:
+        #     serviceName: ssl-redirect
+        #     servicePort: use-annotation
+        ## for Kubernetes >=1.19 (when "networking.k8s.io/v1" is used)
+        # - path: /*
+        #   pathType: Prefix
+        #   backend:
+        #     service:
+        #       name: ssl-redirect
+        #       port:
+        #         name: use-annotation
+    tls: []
+    #  - secretName: chart-example-tls
+    #    hosts:
+    #      - chart-example.local
+  terminationGracePeriodSeconds: 10
+  lifecycle: {}

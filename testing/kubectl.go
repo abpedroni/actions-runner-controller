@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 
-	"github.com/actions-runner-controller/actions-runner-controller/testing/runtime"
+	"github.com/actions/actions-runner-controller/testing/runtime"
 )
 
 type Kubectl struct {
@@ -86,6 +87,16 @@ func (k *Kubectl) CreateCMLiterals(ctx context.Context, name string, literals ma
 	return nil
 }
 
+func (k *Kubectl) DeleteCM(ctx context.Context, name string, cfg KubectlConfig) error {
+	args := []string{"cm", name}
+
+	if _, err := k.CombinedOutput(k.kubectlCmd(ctx, "delete", args, cfg)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (k *Kubectl) Apply(ctx context.Context, path string, cfg KubectlConfig) error {
 	if _, err := k.CombinedOutput(k.kubectlCmd(ctx, "apply", []string{"-f", path}, cfg)); err != nil {
 		return err
@@ -96,6 +107,35 @@ func (k *Kubectl) Apply(ctx context.Context, path string, cfg KubectlConfig) err
 
 func (k *Kubectl) WaitUntilDeployAvailable(ctx context.Context, name string, cfg KubectlConfig) error {
 	if _, err := k.CombinedOutput(k.kubectlCmd(ctx, "wait", []string{"deploy/" + name, "--for=condition=available"}, cfg)); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (k *Kubectl) FindPods(ctx context.Context, label string, cfg KubectlConfig) ([]string, error) {
+	args := []string{"po", "-l", label, "-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}`}
+
+	out, err := k.CombinedOutput(k.kubectlCmd(ctx, "get", args, cfg))
+	if err != nil {
+		return nil, err
+	}
+
+	var pods []string
+	for _, l := range strings.Split(out, "\n") {
+		if l != "" {
+			pods = append(pods, l)
+		}
+	}
+
+	return pods, nil
+}
+
+func (k *Kubectl) DeletePods(ctx context.Context, names []string, cfg KubectlConfig) error {
+	args := []string{"po"}
+	args = append(args, names...)
+
+	if _, err := k.CombinedOutput(k.kubectlCmd(ctx, "delete", args, cfg)); err != nil {
 		return err
 	}
 
@@ -114,7 +154,7 @@ func (k *Kubectl) kubectlCmd(ctx context.Context, c string, args []string, cfg K
 	}
 
 	if cfg.Timeout > 0 {
-		args = append(args, "--timeout="+fmt.Sprintf("%s", cfg.Timeout))
+		args = append(args, fmt.Sprintf("--timeout=%v", cfg.Timeout.String()))
 	}
 
 	cmd := exec.CommandContext(ctx, "kubectl", args...)

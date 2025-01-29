@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/actions-runner-controller/actions-runner-controller/github"
-	gogithub "github.com/google/go-github/v39/github"
+	"github.com/actions/actions-runner-controller/github"
+	gogithub "github.com/google/go-github/v52/github"
 )
 
 type server struct {

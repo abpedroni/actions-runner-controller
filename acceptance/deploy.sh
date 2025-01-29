@@ -35,14 +35,63 @@ else
   echo 'Skipped deploying secret "github-webhook-server". Set WEBHOOK_GITHUB_TOKEN to deploy.' 1>&2
 fi
 
+if [ -n "${WEBHOOK_GITHUB_TOKEN}" ] && [ -z "${CREATE_SECRETS_USING_HELM}" ]; then
+  kubectl -n actions-runner-system delete secret \
+      actions-metrics-server || :
+  kubectl -n actions-runner-system create secret generic \
+      actions-metrics-server \
+      --from-literal=github_token=${WEBHOOK_GITHUB_TOKEN:?WEBHOOK_GITHUB_TOKEN must not be empty}
+else
+  echo 'Skipped deploying secret "actions-metrics-server". Set WEBHOOK_GITHUB_TOKEN to deploy.' 1>&2
+fi
+
 tool=${ACCEPTANCE_TEST_DEPLOYMENT_TOOL}
 
 TEST_ID=${TEST_ID:-default}
 
 if [ "${tool}" == "helm" ]; then
   set -v
+
+  CHART=${CHART:-charts/actions-runner-controller}
+
+  flags=()
+  if [ "${IMAGE_PULL_SECRET}" != "" ]; then
+    flags+=( --set imagePullSecrets[0].name=${IMAGE_PULL_SECRET})
+    flags+=( --set image.actionsRunnerImagePullSecrets[0].name=${IMAGE_PULL_SECRET})
+    flags+=( --set githubWebhookServer.imagePullSecrets[0].name=${IMAGE_PULL_SECRET})
+    flags+=( --set actionsMetricsServer.imagePullSecrets[0].name=${IMAGE_PULL_SECRET})
+  fi
+  if [ "${WATCH_NAMESPACE}" != "" ]; then
+    flags+=( --set watchNamespace=${WATCH_NAMESPACE} --set singleNamespace=true)
+  fi
+  if [ "${CHART_VERSION}" != "" ]; then
+    flags+=( --version ${CHART_VERSION})
+  fi
+  if [ "${LOG_FORMAT}" != "" ]; then
+    flags+=( --set logFormat=${LOG_FORMAT})
+    flags+=( --set githubWebhookServer.logFormat=${LOG_FORMAT})
+    flags+=( --set actionsMetricsServer.logFormat=${LOG_FORMAT})
+  fi
+  if [ "${ADMISSION_WEBHOOKS_TIMEOUT}" != "" ]; then
+    flags+=( --set admissionWebHooks.timeoutSeconds=${ADMISSION_WEBHOOKS_TIMEOUT})
+  fi
+  if [ -n "${CREATE_SECRETS_USING_HELM}" ]; then
+    if [ -z "${WEBHOOK_GITHUB_TOKEN}" ]; then
+      echo 'Failed deploying secret "actions-metrics-server" using helm. Set WEBHOOK_GITHUB_TOKEN to deploy.' 1>&2
+      exit 1
+    fi
+    flags+=( --set actionsMetricsServer.secret.create=true)
+    flags+=( --set actionsMetricsServer.secret.github_token=${WEBHOOK_GITHUB_TOKEN})
+  fi
+  if [ -n "${GITHUB_WEBHOOK_SERVER_ENV_NAME}" ] && [ -n "${GITHUB_WEBHOOK_SERVER_ENV_VALUE}" ]; then
+    flags+=( --set githubWebhookServer.env[0].name=${GITHUB_WEBHOOK_SERVER_ENV_NAME})
+    flags+=( --set githubWebhookServer.env[0].value=${GITHUB_WEBHOOK_SERVER_ENV_VALUE})
+  fi
+
+  set -vx
+
   helm upgrade --install actions-runner-controller \
-    charts/actions-runner-controller \
+    ${CHART} \
     -n actions-runner-system \
     --create-namespace \
     --set syncPeriod=${SYNC_PERIOD} \
@@ -51,6 +100,9 @@ if [ "${tool}" == "helm" ]; then
     --set image.tag=${VERSION} \
     --set podAnnotations.test-id=${TEST_ID} \
     --set githubWebhookServer.podAnnotations.test-id=${TEST_ID} \
+    --set actionsMetricsServer.podAnnotations.test-id=${TEST_ID} \
+    ${flags[@]} --set image.imagePullPolicy=${IMAGE_PULL_POLICY} \
+    --set image.dindSidecarRepositoryAndTag=${DIND_SIDECAR_REPOSITORY_AND_TAG} \
     -f ${VALUES_FILE}
   set +v
   # To prevent `CustomResourceDefinition.apiextensions.k8s.io "runners.actions.summerwind.dev" is invalid: metadata.annotations: Too long: must have at most 262144 bytes`
@@ -76,56 +128,3 @@ kubectl -n actions-runner-system wait deploy/actions-runner-controller --for con
 
 # Adhocly wait for some time until actions-runner-controller's admission webhook gets ready
 sleep 20
-
-RUNNER_LABEL=${RUNNER_LABEL:-self-hosted}
-
-if [ -n "${TEST_REPO}" ]; then
-  if [ "${USE_RUNNERSET}" != "false" ]; then
-    cat acceptance/testdata/runnerset.envsubst.yaml | TEST_ENTERPRISE= TEST_ORG= RUNNER_MIN_REPLICAS=${REPO_RUNNER_MIN_REPLICAS} NAME=repo-runnerset envsubst | kubectl apply -f -
-  else
-    echo 'Deploying runnerdeployment and hra. Set USE_RUNNERSET if you want to deploy runnerset instead.'
-    cat acceptance/testdata/runnerdeploy.envsubst.yaml | TEST_ENTERPRISE= TEST_ORG= RUNNER_MIN_REPLICAS=${REPO_RUNNER_MIN_REPLICAS} NAME=repo-runnerdeploy envsubst | kubectl apply -f -
-  fi
-else
-  echo 'Skipped deploying runnerdeployment and hra. Set TEST_REPO to "yourorg/yourrepo" to deploy.'
-fi
-
-if [ -n "${TEST_ORG}" ]; then
-  if [ "${USE_RUNNERSET}" != "false" ]; then
-    cat acceptance/testdata/runnerset.envsubst.yaml | TEST_ENTERPRISE= TEST_REPO= RUNNER_MIN_REPLICAS=${ORG_RUNNER_MIN_REPLICAS} NAME=org-runnerset envsubst | kubectl apply -f -
-  else
-    cat acceptance/testdata/runnerdeploy.envsubst.yaml | TEST_ENTERPRISE= TEST_REPO= RUNNER_MIN_REPLICAS=${ORG_RUNNER_MIN_REPLICAS} NAME=org-runnerdeploy envsubst | kubectl apply -f -
-  fi
-
-  if [ -n "${TEST_ORG_GROUP}" ]; then
-    if [ "${USE_RUNNERSET}" != "false" ]; then
-      cat acceptance/testdata/runnerset.envsubst.yaml | TEST_ENTERPRISE= TEST_REPO= RUNNER_MIN_REPLICAS=${ORG_RUNNER_MIN_REPLICAS} TEST_GROUP=${TEST_ORG_GROUP} NAME=orgroupg-runnerset envsubst | kubectl apply -f -
-    else
-      cat acceptance/testdata/runnerdeploy.envsubst.yaml | TEST_ENTERPRISE= TEST_REPO= RUNNER_MIN_REPLICAS=${ORG_RUNNER_MIN_REPLICAS} TEST_GROUP=${TEST_ORG_GROUP} NAME=orggroup-runnerdeploy envsubst | kubectl apply -f -
-    fi
-  else
-    echo 'Skipped deploying enterprise runnerdeployment. Set TEST_ORG_GROUP to deploy.'
-  fi
-else
-  echo 'Skipped deploying organizational runnerdeployment. Set TEST_ORG to deploy.'
-fi
-
-if [ -n "${TEST_ENTERPRISE}" ]; then
-  if [ "${USE_RUNNERSET}" != "false" ]; then
-    cat acceptance/testdata/runnerset.envsubst.yaml | TEST_ORG= TEST_REPO= RUNNER_MIN_REPLICAS=${ENTERPRISE_RUNNER_MIN_REPLICAS} NAME=enterprise-runnerset envsubst | kubectl apply -f -
-  else
-    cat acceptance/testdata/runnerdeploy.envsubst.yaml | TEST_ORG= TEST_REPO= RUNNER_MIN_REPLICAS=${ENTERPRISE_RUNNER_MIN_REPLICAS} NAME=enterprise-runnerdeploy envsubst | kubectl apply -f -
-  fi
-
-  if [ -n "${TEST_ENTERPRISE_GROUP}" ]; then
-    if [ "${USE_RUNNERSET}" != "false" ]; then
-      cat acceptance/testdata/runnerset.envsubst.yaml | TEST_ORG= TEST_REPO= RUNNER_MIN_REPLICAS=${ENTERPRISE_RUNNER_MIN_REPLICAS} TEST_GROUP=${TEST_ENTERPRISE_GROUP} NAME=enterprisegroup-runnerset envsubst | kubectl apply -f -
-    else
-      cat acceptance/testdata/runnerdeploy.envsubst.yaml | TEST_ORG= TEST_REPO= RUNNER_MIN_REPLICAS=${ENTERPRISE_RUNNER_MIN_REPLICAS} TEST_GROUP=${TEST_ENTERPRISE_GROUP} NAME=enterprisegroup-runnerdeploy envsubst | kubectl apply -f -
-    fi
-  else
-    echo 'Skipped deploying enterprise runnerdeployment. Set TEST_ENTERPRISE_GROUP to deploy.'
-  fi
-else
-  echo 'Skipped deploying enterprise runnerdeployment. Set TEST_ENTERPRISE to deploy.'
-fi
